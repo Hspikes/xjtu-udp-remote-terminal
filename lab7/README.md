@@ -23,8 +23,15 @@
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -U pip
 python -m pip install -r lab7/requirements.txt
+```
+
+`requirements.txt` 已固定到 Python 3.12 可用的 Streamlit 版本，避免 pip 解析时回退到旧 Streamlit/Tornado。网络较慢或代理不稳定时，使用较长超时或国内镜像：
+
+```bash
+python -m pip install --default-timeout 120 -r lab7/requirements.txt
+# 或
+python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --default-timeout 120 -r lab7/requirements.txt
 ```
 
 如果提示缺少 `venv` 模块，先安装系统包：
