@@ -1,7 +1,7 @@
 name: Claude Code
 
 on:
-  # 自动 PR 审查：适合 fork PR，因为 pull_request_target 能访问 base 仓库 secrets
+  # 自动 PR 审查：适合 fork PR
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
@@ -38,6 +38,11 @@ jobs:
       id-token: write
 
     steps:
+      - name: Checkout base repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Run Claude automatic PR review
         uses: anthropics/claude-code-action@v1
         with:
@@ -54,9 +59,8 @@ jobs:
 
             Review requirements:
             - Focus on correctness, logic bugs, edge cases, security issues, and maintainability.
-            - Do not comment on purely stylistic issues unless they may cause real problems.
             - Do not modify files or push commits.
-            - Do not run untrusted code from the pull request.
+            - Do not run code from the pull request.
             - Analyze the PR diff and relevant repository context.
             - Post a concise PR review summary.
             - Use inline review comments only for concrete issues tied to specific changed lines.
@@ -87,6 +91,11 @@ jobs:
       id-token: write
 
     steps:
+      - name: Checkout base repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Run Claude on mention
         uses: anthropics/claude-code-action@v1
         with:
