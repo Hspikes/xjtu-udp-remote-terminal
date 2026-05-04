@@ -60,6 +60,23 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(packet.payload, b"")
         self.assertEqual(packet.ack, 44)
 
+    def test_auth_packet_types_round_trip(self):
+        auth_payload = b'{"username":"alice","password":"123456"}'
+        auth = unpack_packet(pack_packet(PacketType.AUTH, client_id=11, payload=auth_payload))
+        self.assertIsNotNone(auth)
+        self.assertEqual(auth.packet_type, PacketType.AUTH)
+        self.assertEqual(auth.payload, auth_payload)
+
+        auth_ok = unpack_packet(pack_packet(PacketType.AUTH_OK, client_id=11, payload=b"ok"))
+        self.assertIsNotNone(auth_ok)
+        self.assertEqual(auth_ok.packet_type, PacketType.AUTH_OK)
+
+        auth_fail = unpack_packet(
+            pack_packet(PacketType.AUTH_FAIL, client_id=11, payload=b"bad password")
+        )
+        self.assertIsNotNone(auth_fail)
+        self.assertEqual(auth_fail.packet_type, PacketType.AUTH_FAIL)
+
     def test_max_payload_round_trip(self):
         payload = b"x" * MAX_PAYLOAD
         packet = unpack_packet(pack_packet(PacketType.DATA, client_id=2, seq=1, payload=payload))

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import json
 import os
 import random
 import selectors
@@ -31,6 +33,7 @@ class UDPRemoteTerminalClient:
         client_id: Optional[int] = None,
         heartbeat_interval: float = 5.0,
         server_timeout: float = 20.0,
+        auth_timeout: float = 10.0,
         retransmit_timeout: float = 0.5,
         window_size: int = 8,
     ) -> None:
@@ -40,6 +43,7 @@ class UDPRemoteTerminalClient:
             raise ValueError("client_id 0 is reserved")
         self.heartbeat_interval = heartbeat_interval
         self.server_timeout = server_timeout
+        self.auth_timeout = auth_timeout
         self.selector = selectors.DefaultSelector()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.connect(self.server_addr)
@@ -57,6 +61,7 @@ class UDPRemoteTerminalClient:
         self.resize_pending = True
         self.last_heartbeat = 0.0
         self.last_rx = time.monotonic()
+        self.authenticated = False
 
     @staticmethod
     def _random_client_id() -> int:
@@ -65,10 +70,15 @@ class UDPRemoteTerminalClient:
     def run(self) -> int:
         if not os.isatty(self.stdin_fd):
             raise RuntimeError("client.py must be run from an interactive terminal")
-        self._enter_raw_mode()
-        self.selector.register(self.stdin_fd, selectors.EVENT_READ, data="stdin")
-        self._install_signal_handlers()
+        exit_code = 1
         try:
+            if not self._authenticate():
+                return exit_code
+            self.authenticated = True
+            exit_code = 0
+            self._enter_raw_mode()
+            self.selector.register(self.stdin_fd, selectors.EVENT_READ, data="stdin")
+            self._install_signal_handlers()
             self._send_resize()
             self._send_heartbeat()
             while self.running:
@@ -89,11 +99,63 @@ class UDPRemoteTerminalClient:
                     self._write_status("\r\n[client] server timeout; exiting\r\n")
                     self.running = False
         finally:
-            self._send_close_best_effort()
+            if self.authenticated:
+                self._send_close_best_effort()
             self._restore_terminal()
             self._cleanup_selector()
             self.sock.close()
-        return 0
+        return exit_code
+
+    def _authenticate(self) -> bool:
+        try:
+            username = input("Username: ")
+            password = getpass.getpass("Password: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n[client] authentication cancelled", file=sys.stderr)
+            return False
+
+        payload = json.dumps(
+            {"username": username, "password": password},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self._send_raw(pack_packet(PacketType.AUTH, client_id=self.client_id, payload=payload))
+        if not self.running:
+            return False
+
+        deadline = time.monotonic() + self.auth_timeout
+        while time.monotonic() < deadline:
+            timeout = max(0.0, min(0.1, deadline - time.monotonic()))
+            events = self.selector.select(timeout=timeout)
+            for key, _mask in events:
+                if key.data != "udp":
+                    continue
+                result = self._receive_auth_response()
+                if result is not None:
+                    return result
+        print("[client] authentication timed out", file=sys.stderr)
+        return False
+
+    def _receive_auth_response(self) -> Optional[bool]:
+        while True:
+            try:
+                data = self.sock.recv(65535)
+            except BlockingIOError:
+                return None
+            except OSError as exc:
+                print(f"[client] UDP receive error during authentication: {exc}", file=sys.stderr)
+                self.running = False
+                return False
+            packet = unpack_packet(data)
+            if packet is None or packet.client_id != self.client_id:
+                continue
+            if packet.packet_type == PacketType.AUTH_OK:
+                self.last_rx = time.monotonic()
+                print("[client] authentication succeeded")
+                return True
+            if packet.packet_type == PacketType.AUTH_FAIL:
+                message = packet.payload.decode("utf-8", errors="replace") or "authentication failed"
+                print(f"[client] authentication failed: {message}", file=sys.stderr)
+                return False
 
     def _install_signal_handlers(self) -> None:
         def on_winch(_signum, _frame) -> None:
@@ -166,6 +228,10 @@ class UDPRemoteTerminalClient:
         elif packet.packet_type == PacketType.RESIZE:
             self._send_ack(packet.seq)
         elif packet.packet_type == PacketType.CLOSE:
+            self.running = False
+        elif packet.packet_type == PacketType.AUTH_FAIL:
+            message = packet.payload.decode("utf-8", errors="replace") or "authentication failed"
+            self._write_status(f"\r\n[client] authentication failed: {message}\r\n")
             self.running = False
 
     def _flush_outbound(self, now: float) -> None:
@@ -242,6 +308,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--client-id", type=lambda value: int(value, 0), default=None)
     parser.add_argument("--heartbeat-interval", type=float, default=5.0)
     parser.add_argument("--server-timeout", type=float, default=20.0)
+    parser.add_argument("--auth-timeout", type=float, default=10.0)
     parser.add_argument("--retransmit-timeout", type=float, default=0.5)
     parser.add_argument("--window-size", type=int, default=8)
     return parser.parse_args(argv)
@@ -255,6 +322,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         client_id=args.client_id,
         heartbeat_interval=args.heartbeat_interval,
         server_timeout=args.server_timeout,
+        auth_timeout=args.auth_timeout,
         retransmit_timeout=args.retransmit_timeout,
         window_size=args.window_size,
     )

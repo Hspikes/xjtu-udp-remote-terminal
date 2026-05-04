@@ -1,0 +1,10 @@
+{
+  "alice": {
+    "password_hash": "pbkdf2_sha256$200000$YWxpY2UtZGVtby1zYWx0$/LmLKx6FMQkeMlSrhRHwqbWaREzIPk7+EHLL6BJ8Uns=",
+    "home": "alice"
+  },
+  "bob": {
+    "password_hash": "pbkdf2_sha256$200000$Ym9iLWRlbW8tc2FsdA==$RHUA6lIjLTBTroPY0ut7lP3voJMj3EeDUTJJLD3oDdo=",
+    "home": "bob"
+  }
+}
