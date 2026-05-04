@@ -18,11 +18,22 @@
 - Python 3.10+（核心功能未使用第三方依赖）
 - Linux 或 macOS 终端；推荐 Linux
 - 服务端需要能启动 `/bin/bash` 或当前 `$SHELL`
-- 可选监控前端需要安装 Streamlit：
+- 可选监控前端需要安装 Streamlit。Ubuntu/Debian 的系统 Python 可能启用 PEP 668，直接执行 `python3 -m pip install ...` 会出现 `externally-managed-environment`，推荐使用虚拟环境：
 
 ```bash
-python3 -m pip install -r lab7/requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r lab7/requirements.txt
 ```
+
+如果提示缺少 `venv` 模块，先安装系统包：
+
+```bash
+sudo apt install python3.12-venv
+```
+
+核心 UDP 终端、服务端内置 HTTP 监控 API 和单元测试不依赖 Streamlit；只有图形监控页面需要安装该依赖。
 
 ## 启动方法
 
