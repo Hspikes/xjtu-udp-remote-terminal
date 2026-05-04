@@ -15,6 +15,8 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 
 为满足课程演示中的基础访问控制需求，本实验在创建 PTY session 之前增加用户名密码认证。服务端从 `users.json` 读取用户配置，密码不以明文保存，而是保存 PBKDF2-HMAC-SHA256 哈希；客户端连接后先发送 `AUTH` 报文，认证成功后服务端返回 `AUTH_OK` 并把 shell 初始目录切换到该用户的独立目录。该方案需要配合云服务器安全组只允许本地公网 IP 访问 UDP 端口。
 
+在远程终端主链路之外，本实验新增只读监控通道。服务端为每个 PTY session 维护内存状态，并通过 bash `PROMPT_COMMAND` hook 将当前目录和最近命令写入用户目录根下的状态文件。HTTP 监控 API 与 UDP 服务端同进程运行，只读取 session 快照、状态文件和用户 home 内文件列表，不向 shell 注入输入，也不提供执行命令接口。Streamlit 页面通过该 API 展示连接总览、当前目录、文件列表和最近命令。
+
 ## 实验目的
 
 1. 掌握 UDP socket 服务端和客户端程序编写方法。
@@ -24,6 +26,7 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 5. 掌握 PTY 远程终端原理，处理控制字符、ANSI 转义序列和窗口大小同步。
 6. 实现多客户端并发、心跳保活和异常清理。
 7. 实现实验级用户认证、用户独立初始目录和演示环境访问控制说明。
+8. 实现只读监控 API 和 Web 页面，观察在线 session、当前目录、文件列表和最近命令。
 
 ## 实验内容
 
@@ -40,6 +43,8 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 - 支持 `pwd`、`ls`、`ps`、`ip addr` 等基础命令。
 - 服务端根据 `client_id` 为不同客户端维护独立 session。
 - 客户端周期性发送心跳，服务端心跳超时后清理对应 session。
+- 服务端提供只读 HTTP API，返回连接状态、当前目录、最近命令和 home 内文件列表。
+- Streamlit 页面轮询 HTTP API，展示总览和单个连接详情。
 
 ### 高级功能
 
@@ -49,6 +54,7 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 - 服务端使用 PTY，使 `ping` 能实时输出，`top`/`vim` 能进行基础全屏交互。
 - 客户端捕获 `SIGWINCH`，向服务端发送窗口行列数；服务端用 `TIOCSWINSZ` 同步 PTY 大小。
 - 可靠层采用默认窗口大小 8 的滑动窗口，提升连续输出场景下的传输效率。
+- 监控 API 默认绑定 `127.0.0.1`，支持可选 Bearer token；文件列表严格限制在登录用户 home 目录内。
 
 ## 实验实现
 
@@ -59,7 +65,7 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 
 ### 实验设计
 
-系统采用 C/S 模式：客户端和服务端通过 UDP 通信。服务端使用一个 UDP socket 接收所有客户端报文，并通过 `client_id` 区分不同客户端。每个客户端连接后必须先发送 `AUTH` 报文，服务端校验用户名和密码；认证通过后才创建独立 PTY shell session，并将 shell 初始目录切换到该用户目录。服务端主循环使用 `selectors` 同时监听 UDP socket 和多个 PTY fd，因此无需为每个客户端创建独立线程。
+系统采用 C/S 模式：客户端和服务端通过 UDP 通信。服务端使用一个 UDP socket 接收所有客户端报文，并通过 `client_id` 区分不同客户端。每个客户端连接后必须先发送 `AUTH` 报文，服务端校验用户名和密码；认证通过后才创建独立 PTY shell session，并将 shell 初始目录切换到该用户目录。服务端主循环使用 `selectors` 同时监听 UDP socket 和多个 PTY fd，因此无需为每个客户端创建独立线程。监控 HTTP API 作为同进程后台线程运行，通过加锁读取服务端 session 快照，避免引入进程间通信。
 
 数据流如下：
 
@@ -70,6 +76,7 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 5. PTY 有输出时，服务端按不超过 1200 字节切片，发送 `DATA` 给客户端。
 6. 客户端收到服务端 `DATA` 后回复 `ACK`，按序写入 stdout。
 7. 客户端定时发送 `HEARTBEAT`；服务端超过 15 秒未收到某客户端报文则清理该 session。
+8. bash 每次回到 prompt 时写入当前目录和最近命令状态文件；监控 API 读取状态文件并转换为 JSON 返回给 Streamlit 页面。
 
 ### 协议
 
@@ -111,7 +118,9 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 
 ### UI 设计
 
-本实验为命令行终端程序，没有图形界面。客户端启动后先在普通终端模式提示 `Username:` 和 `Password:`，其中密码使用 `getpass.getpass()` 输入，避免显示在本地屏幕上。认证成功后客户端进入 raw terminal 模式，本地终端显示来自远程 PTY 的完整输出。用户看到的交互效果接近 SSH：输入字符、方向键、Tab、Ctrl+C 等均发送到服务端 shell；服务端输出直接显示在客户端终端。
+终端交互界面仍是命令行。客户端启动后先在普通终端模式提示 `Username:` 和 `Password:`，其中密码使用 `getpass.getpass()` 输入，避免显示在本地屏幕上。认证成功后客户端进入 raw terminal 模式，本地终端显示来自远程 PTY 的完整输出。用户看到的交互效果接近 SSH：输入字符、方向键、Tab、Ctrl+C 等均发送到服务端 shell；服务端输出直接显示在客户端终端。
+
+新增的监控界面使用 Streamlit 实现。总览区域展示当前连接数、在线用户数、已知用户数和 UDP 服务地址；session 表格展示 `client_id`、用户、地址、当前目录、窗口大小、空闲时间和待确认报文数；详情区域可选择某个连接，查看基本信息、当前目录文件列表以及最近 10 条命令。页面只调用只读 HTTP API，不提供远程命令执行入口。
 
 ### 框架结构
 
@@ -120,12 +129,16 @@ lab7/
 ├── udp_remote_terminal/
 │   ├── __init__.py
 │   ├── client.py
+│   ├── monitor.py
 │   ├── protocol.py
 │   ├── reliable.py
 │   ├── server.py
+│   ├── streamlit_monitor.py
 │   ├── users.json
 │   └── user_homes/
+├── requirements.txt
 ├── tests/
+│   ├── test_monitor.py
 │   ├── test_protocol.py
 │   ├── test_reliable.py
 │   └── test_server_auth.py
@@ -139,8 +152,16 @@ lab7/
 - 收到新 `client_id` 的首个报文时，只允许 `AUTH`，否则拒绝创建 PTY。
 - 认证通过后解析用户 home 目录，自动创建目录，并在 PTY 子进程中先 `chdir` 再执行 shell。
 - `selectors` 同时监听 UDP socket 和所有客户端 PTY fd。
-- `sessions` 字典以 `client_id` 为 key，保存客户端地址、PTY fd、shell pid、可靠传输状态、心跳时间和窗口大小。
-- 收到 `CLOSE`、PTY 关闭或心跳超时时，注销 selector、关闭 fd、向 shell 发送 `SIGHUP` 并删除 session。
+- `sessions` 字典以 `client_id` 为 key，保存客户端地址、PTY fd、shell pid、可靠传输状态、连接时间、最后活跃时间、状态文件目录、当前目录、最近命令和窗口大小。
+- 认证成功时为 session 创建 `.udpterm_state/session_<id>.cwd` 和 `.tsv` 状态文件，并通过环境变量注入 bash hook。
+- `snapshot_sessions()`、`snapshot_session()` 和 `list_session_files()` 返回纯 dict，供 HTTP API 使用；文件列表只允许访问 home 内相对路径。
+- 收到 `CLOSE`、PTY 关闭或心跳超时时，注销 selector、关闭 fd、向 shell 发送 `SIGHUP`，删除 session 并清理状态文件。
+
+监控 API 框架：
+
+- `monitor.py` 使用 `ThreadingHTTPServer` 提供 `/healthz`、`/api/stats`、`/api/sessions`、`/api/sessions/<client_id>` 和 `/api/sessions/<client_id>/files`。
+- `/healthz` 不需要认证；设置 `--monitor-token` 后，`/api/*` 必须携带 `Authorization: Bearer <token>`。
+- HTTP 层不直接返回 `ClientSession` 对象，只调用服务端快照方法，降低线程间共享对象风险。
 
 客户端框架：
 
@@ -157,6 +178,8 @@ lab7/
 - `reliable.py`：自主编写。`ReliableEndpoint` 维护 `_send_queue`、`_unacked`、`_expected_seq` 和 `_receive_buffer`。`get_packets_to_send()` 控制滑动窗口，`get_packets_to_retransmit()` 扫描超时包，`on_data()` 实现重复包过滤和按序交付。
 - `server.py`：自主编写。使用 `json` 读取用户库，使用 `hashlib.pbkdf2_hmac()` 和 `hmac.compare_digest()` 校验密码；通过 `pty.fork()` 为认证客户端创建独立 shell；在子进程中切换到用户目录；用 `selectors` 复用 UDP socket 和 PTY fd；用 `TIOCSWINSZ` 同步窗口大小；根据心跳超时清理资源。
 - `client.py`：自主编写。认证前使用普通终端输入用户名和密码；认证成功后用 `tty.setraw()` 进入 raw 模式，使用 `selectors` 同时监听 stdin 和 UDP socket；所有控制字符透明传输；退出时恢复终端属性。
+- `monitor.py`：自主编写。使用标准库 `http.server` 暴露只读 JSON API，支持 Bearer token、404/403/400/401 错误响应和无缓存响应头。
+- `streamlit_monitor.py`：自主编写。使用 Streamlit 构建监控页面，使用标准库 `urllib.request` 请求 API，不额外引入 `requests`、`pandas` 或自动刷新插件。
 
 ## 测试及结果分析
 
@@ -180,6 +203,9 @@ python3 -m unittest discover -s lab7/tests
 - 重复包只处理一次，乱序包缓存后按序交付。
 - PBKDF2 密码校验、用户库字段校验、用户 home 路径越界拒绝。
 - 未认证客户端发送 `DATA` 时，服务端不创建 shell session。
+- session 快照字段、状态文件解析、最近命令去重和最多 10 条限制。
+- 文件列表接口拒绝 `../` 越权路径。
+- Monitor API 的健康检查、token 校验、session 查询和错误状态码。
 
 > 此处放置单元测试通过截图。
 
@@ -313,7 +339,38 @@ vim test.txt
 
 结果分析：全屏程序依赖 PTY、ANSI 转义序列和窗口大小信息。本实现对控制字符和 ANSI 序列进行透明传输，并通过 `RESIZE` 报文同步行列数，因此能够支持基础全屏交互。
 
-### 测试8：抓包验证
+### 测试8：监控 API 与 Streamlit 页面
+
+启动服务端后运行：
+
+```bash
+streamlit run lab7/udp_remote_terminal/streamlit_monitor.py \
+  -- --api http://127.0.0.1:9100
+```
+
+在客户端中使用 `alice` 登录并执行：
+
+```bash
+pwd
+touch a.txt
+ls
+```
+
+预期结果：Streamlit 页面显示 `alice` 的连接信息、IP、连接时间、最后活跃时间、窗口大小和当前目录；当前目录文件列表中出现 `a.txt`；最近命令中出现 `pwd`、`touch a.txt`、`ls`。再使用 `bob` 登录时，页面显示两个独立 session，命令历史和文件列表互不混淆。关闭客户端后，连接数减少。
+
+安全验证：
+
+```bash
+curl http://127.0.0.1:9100/api/sessions/<client_id>/files?path=../
+```
+
+预期返回 403。设置 `--monitor-token` 后，不带 `Authorization` 访问 `/api/stats` 返回 401，携带正确 `Authorization: Bearer <token>` 后正常返回 JSON。
+
+> 此处放置监控总览、连接详情和 token 验证截图。
+
+结果分析：监控通道与终端输入输出链路解耦，页面只读取服务端快照和状态文件，不影响 PTY shell。路径显示采用 home 内相对路径，文件列表经过 `relative_to(home)` 校验，能够避免通过 `../` 浏览其他目录。
+
+### 测试9：抓包验证
 
 抓包命令：
 
@@ -339,7 +396,7 @@ sudo tcpdump -i any udp port 9000 -X
 
 本实验完成了基于 UDP 的远程终端程序。程序通过自定义固定头部协议解决了 UDP 报文类型区分、合法性校验和元数据传递问题；通过 ACK、序列号、滑动窗口、超时重传和去重机制增强了 UDP 传输可靠性；通过 PTY 和 raw terminal 透传控制字符，实现了接近真实终端的远程 shell 交互。服务端使用 `selectors` 支持多客户端并发，并通过心跳机制清理异常离线 session。
 
-在此基础上，程序增加了实验级登录认证：服务端保存 PBKDF2-HMAC-SHA256 密码哈希，客户端认证成功后才会创建 PTY session，不同用户默认进入不同初始目录。结合云服务器安全组只允许本地公网 IP 访问 UDP 9000，可以满足课程演示中的基础访问控制需求。
+在此基础上，程序增加了实验级登录认证和只读监控功能：服务端保存 PBKDF2-HMAC-SHA256 密码哈希，客户端认证成功后才会创建 PTY session，不同用户默认进入不同初始目录；监控 API 和 Streamlit 页面可以查看在线连接、当前目录、文件列表和最近命令，便于课堂演示和调试。结合云服务器安全组只允许本地公网 IP 访问 UDP 9000，并让监控 API 默认监听 `127.0.0.1`，可以满足课程演示中的基础访问控制需求。
 
 需要明确的是，当前目录隔离只是“初始目录隔离”，不是强安全边界。如果服务端仍以同一个 Linux 用户运行 `/bin/bash`，远程用户仍可能通过 `cd ..` 访问该 Linux 用户有权限访问的上层目录或文件；同时认证报文中的密码仍以明文 UDP payload 传输。如果要用于公网或真实生产环境，应改用 SSH，或进一步加入加密认证、HMAC、防重放机制，并在服务端使用 Linux 系统用户、`setuid()`/`setgid()`、`chroot`、容器或 namespace 实现系统级隔离。
 
@@ -349,7 +406,7 @@ UDP 编程的难点不在于 socket API，而在于协议层需要自行处理�
 
 ## 附件
 
-1. 源码文件：`udp_remote_terminal/protocol.py`、`udp_remote_terminal/reliable.py`、`udp_remote_terminal/server.py`、`udp_remote_terminal/client.py`、`udp_remote_terminal/users.json`。
-2. 测试文件：`tests/test_protocol.py`、`tests/test_reliable.py`、`tests/test_server_auth.py`。
-3. 运行说明：`udp_remote_terminal/README.md`。
+1. 源码文件：`udp_remote_terminal/protocol.py`、`udp_remote_terminal/reliable.py`、`udp_remote_terminal/server.py`、`udp_remote_terminal/client.py`、`udp_remote_terminal/monitor.py`、`udp_remote_terminal/streamlit_monitor.py`、`udp_remote_terminal/users.json`。
+2. 测试文件：`tests/test_protocol.py`、`tests/test_reliable.py`、`tests/test_server_auth.py`、`tests/test_monitor.py`。
+3. 运行说明：`README.md`、`requirements.txt`。
 4. 参考资料：实验指导书《高阶 题目5 基于UDP的远程终端实验指导书.docx》、实验七 PPT《实验七_Socket网络编程实验.pptx》、Python 官方文档中 `socket`、`selectors`、`pty`、`termios` 模块说明。
