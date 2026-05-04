@@ -29,7 +29,7 @@ jobs:
     timeout-minutes: 20
 
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
       issues: write
       actions: read
@@ -46,7 +46,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
-            Please review this pull request.
+            Please review this pull request and decide whether to merge it.
 
             Repository: ${{ github.repository }}
             Pull request number: ${{ github.event.pull_request.number }}
@@ -55,18 +55,19 @@ jobs:
             Base branch: ${{ github.event.pull_request.base.ref }}
             Head branch: ${{ github.event.pull_request.head.ref }}
 
-            Review requirements:
-            - Focus on correctness, logic bugs, edge cases, security issues, and maintainability.
-            - Do not modify files or push commits.
-            - Do not run code from the pull request.
-            - Analyze the PR diff and relevant repository context.
-            - Post a concise PR review summary.
-            - Use inline review comments only for concrete issues tied to specific changed lines.
-            - If there are no substantial issues, say so clearly.
+            Review process:
+            1. Analyze the PR diff and relevant repository context.
+            2. Focus on correctness, logic bugs, edge cases, security issues, and maintainability.
+            3. Post a concise PR review summary with inline comments for any issues.
+
+            Merge policy:
+            - If the PR has NO critical issues (no bugs, no security vulnerabilities, no breaking changes), APPROVE and MERGE it automatically using `gh pr merge --squash`.
+            - If the PR has minor style or suggestion-level issues but is otherwise correct, still APPROVE and MERGE it, noting the suggestions in your review.
+            - If the PR has critical issues (bugs, security problems, breaking changes, or incomplete implementation), do NOT merge. Request changes and explain what needs to be fixed.
 
           claude_args: |
-            --max-turns 5
-            --allowedTools "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
+            --max-turns 10
+            --allowedTools "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr merge:*),Bash(gh pr review:*),mcp__github_inline_comment__create_inline_comment"
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
 
