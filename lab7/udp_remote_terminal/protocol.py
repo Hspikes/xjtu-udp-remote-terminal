@@ -30,6 +30,9 @@ class PacketType(IntEnum):
     HEARTBEAT = 0x03
     RESIZE = 0x04
     CLOSE = 0x05
+    AUTH = 0x06
+    AUTH_OK = 0x07
+    AUTH_FAIL = 0x08
 
 
 # magic, version, type, flags, header_len, client_id, seq, ack,

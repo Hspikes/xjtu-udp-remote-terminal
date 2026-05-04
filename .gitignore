@@ -1,1 +1,3 @@
 __pycache__
+lab7/udp_remote_terminal/user_homes/*
+!lab7/udp_remote_terminal/user_homes/.gitkeep

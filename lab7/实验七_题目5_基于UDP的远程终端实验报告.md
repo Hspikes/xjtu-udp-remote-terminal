@@ -13,6 +13,8 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 
 远程终端的核心思想是：客户端采集本地键盘输入，将普通字符、回车、退格、Tab、方向键、Ctrl+C 等控制字符通过 UDP 发送给服务端；服务端为每个客户端创建独立伪终端（PTY）和 shell 子进程，把客户端输入写入 PTY；PTY 产生的输出再通过 UDP 返回客户端，由客户端写入本地 stdout。PTY 可以让服务端 shell 认为自己连接的是一个真实终端，因此能够支持 `top`、`vim` 等全屏交互式程序。
 
+为满足课程演示中的基础访问控制需求，本实验在创建 PTY session 之前增加用户名密码认证。服务端从 `users.json` 读取用户配置，密码不以明文保存，而是保存 PBKDF2-HMAC-SHA256 哈希；客户端连接后先发送 `AUTH` 报文，认证成功后服务端返回 `AUTH_OK` 并把 shell 初始目录切换到该用户的独立目录。该方案需要配合云服务器安全组只允许本地公网 IP 访问 UDP 端口。
+
 ## 实验目的
 
 1. 掌握 UDP socket 服务端和客户端程序编写方法。
@@ -21,6 +23,7 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 4. 在应用层实现 ACK、序列号、去重、超时重传和滑动窗口可靠传输。
 5. 掌握 PTY 远程终端原理，处理控制字符、ANSI 转义序列和窗口大小同步。
 6. 实现多客户端并发、心跳保活和异常清理。
+7. 实现实验级用户认证、用户独立初始目录和演示环境访问控制说明。
 
 ## 实验内容
 
@@ -30,6 +33,9 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 - 服务端绑定 UDP 端口，持续接收客户端报文。
 - 自定义协议正确解析魔数、版本、报文类型、客户端 ID、序列号、ACK、数据长度和 checksum。
 - 非法报文直接丢弃，不导致程序崩溃。
+- 客户端连接后必须先发送认证报文，认证成功后才创建远程 shell。
+- 服务端使用 PBKDF2-HMAC-SHA256 校验密码，不保存明文密码。
+- 不同用户登录后默认进入各自独立的初始工作目录。
 - 通过 ACK、序列号、去重、超时重传实现 UDP 应用层可靠传输。
 - 支持 `pwd`、`ls`、`ps`、`ip addr` 等基础命令。
 - 服务端根据 `client_id` 为不同客户端维护独立 session。
@@ -53,15 +59,17 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 
 ### 实验设计
 
-系统采用 C/S 模式：客户端和服务端通过 UDP 通信。服务端使用一个 UDP socket 接收所有客户端报文，并通过 `client_id` 区分不同用户。每个客户端第一次发送 `HEARTBEAT`、`RESIZE` 或 `DATA` 报文后，服务端创建一个独立 PTY shell session。服务端主循环使用 `selectors` 同时监听 UDP socket 和多个 PTY fd，因此无需为每个客户端创建独立线程。
+系统采用 C/S 模式：客户端和服务端通过 UDP 通信。服务端使用一个 UDP socket 接收所有客户端报文，并通过 `client_id` 区分不同客户端。每个客户端连接后必须先发送 `AUTH` 报文，服务端校验用户名和密码；认证通过后才创建独立 PTY shell session，并将 shell 初始目录切换到该用户目录。服务端主循环使用 `selectors` 同时监听 UDP socket 和多个 PTY fd，因此无需为每个客户端创建独立线程。
 
 数据流如下：
 
-1. 客户端 stdin 有输入时，可靠层分配序列号并发送 `DATA`。
-2. 服务端收到 `DATA` 后立即回复 `ACK`，可靠层去重并按序交付给 PTY。
-3. PTY 有输出时，服务端按不超过 1200 字节切片，发送 `DATA` 给客户端。
-4. 客户端收到服务端 `DATA` 后回复 `ACK`，按序写入 stdout。
-5. 客户端定时发送 `HEARTBEAT`；服务端超过 15 秒未收到某客户端报文则清理该 session。
+1. 客户端在普通终端模式输入用户名和密码，发送 `AUTH` JSON payload。
+2. 服务端验证 `users.json` 中的 PBKDF2 密码哈希，成功返回 `AUTH_OK`，失败返回 `AUTH_FAIL`。
+3. 认证成功后，客户端进入 raw terminal 模式；stdin 有输入时，可靠层分配序列号并发送 `DATA`。
+4. 服务端收到 `DATA` 后立即回复 `ACK`，可靠层去重并按序交付给 PTY。
+5. PTY 有输出时，服务端按不超过 1200 字节切片，发送 `DATA` 给客户端。
+6. 客户端收到服务端 `DATA` 后回复 `ACK`，按序写入 stdout。
+7. 客户端定时发送 `HEARTBEAT`；服务端超过 15 秒未收到某客户端报文则清理该 session。
 
 ### 协议
 
@@ -89,6 +97,9 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 - `HEARTBEAT = 0x03`：心跳保活。
 - `RESIZE = 0x04`：窗口大小同步。
 - `CLOSE = 0x05`：关闭连接。
+- `AUTH = 0x06`：登录认证报文，payload 为用户名和密码 JSON。
+- `AUTH_OK = 0x07`：认证成功，服务端已创建 PTY session。
+- `AUTH_FAIL = 0x08`：认证失败或认证 payload 不合法。
 
 非法报文处理规则：
 
@@ -96,10 +107,11 @@ UDP 是无连接、不可靠、面向报文的传输层协议。它不需要建�
 - UDP 数据长度与 `payload_len` 不一致，丢弃。
 - `checksum` 校验失败，丢弃。
 - 未知 `type`，丢弃。
+- 未认证 `client_id` 发送 `DATA`、`RESIZE`、`HEARTBEAT`、`CLOSE` 等非 `AUTH` 报文时，服务端拒绝创建 shell，并返回认证失败提示。
 
 ### UI 设计
 
-本实验为命令行终端程序，没有图形界面。客户端启动后进入 raw terminal 模式，本地终端显示来自远程 PTY 的完整输出。用户看到的交互效果接近 SSH：输入字符、方向键、Tab、Ctrl+C 等均发送到服务端 shell；服务端输出直接显示在客户端终端。
+本实验为命令行终端程序，没有图形界面。客户端启动后先在普通终端模式提示 `Username:` 和 `Password:`，其中密码使用 `getpass.getpass()` 输入，避免显示在本地屏幕上。认证成功后客户端进入 raw terminal 模式，本地终端显示来自远程 PTY 的完整输出。用户看到的交互效果接近 SSH：输入字符、方向键、Tab、Ctrl+C 等均发送到服务端 shell；服务端输出直接显示在客户端终端。
 
 ### 框架结构
 
@@ -111,16 +123,21 @@ lab7/
 │   ├── protocol.py
 │   ├── reliable.py
 │   ├── server.py
-│   └── README.md
+│   ├── users.json
+│   └── user_homes/
 ├── tests/
 │   ├── test_protocol.py
-│   └── test_reliable.py
+│   ├── test_reliable.py
+│   └── test_server_auth.py
 └── 实验七_题目5_基于UDP的远程终端实验报告.md
 ```
 
 服务端框架：
 
 - UDP socket 绑定指定端口并设置非阻塞。
+- 启动时读取 `users.json`，校验每个用户的 `password_hash` 和 `home` 字段。
+- 收到新 `client_id` 的首个报文时，只允许 `AUTH`，否则拒绝创建 PTY。
+- 认证通过后解析用户 home 目录，自动创建目录，并在 PTY 子进程中先 `chdir` 再执行 shell。
 - `selectors` 同时监听 UDP socket 和所有客户端 PTY fd。
 - `sessions` 字典以 `client_id` 为 key，保存客户端地址、PTY fd、shell pid、可靠传输状态、心跳时间和窗口大小。
 - 收到 `CLOSE`、PTY 关闭或心跳超时时，注销 selector、关闭 fd、向 shell 发送 `SIGHUP` 并删除 session。
@@ -128,6 +145,7 @@ lab7/
 客户端框架：
 
 - UDP socket 连接指定服务端地址。
+- 进入 raw 模式前先提示用户名和密码，发送 `AUTH` 并等待 `AUTH_OK` 或 `AUTH_FAIL`。
 - stdin 切换 raw 模式并注册到 selector。
 - stdin 输入进入可靠发送队列；UDP 输出按序写入 stdout。
 - 捕获 `SIGWINCH` 后发送 `RESIZE`。
@@ -135,10 +153,10 @@ lab7/
 
 ### 关键代码的描述
 
-- `protocol.py`：自主编写。使用 `struct.pack/unpack` 实现固定头部二进制协议，使用 `zlib.crc32` 计算 checksum。`unpack_packet()` 对非法数据统一返回 `None`，保证网络接收循环不会因异常数据崩溃。
+- `protocol.py`：自主编写。使用 `struct.pack/unpack` 实现固定头部二进制协议，使用 `zlib.crc32` 计算 checksum。新增 `AUTH`、`AUTH_OK`、`AUTH_FAIL` 三类认证报文。`unpack_packet()` 对非法数据统一返回 `None`，保证网络接收循环不会因异常数据崩溃。
 - `reliable.py`：自主编写。`ReliableEndpoint` 维护 `_send_queue`、`_unacked`、`_expected_seq` 和 `_receive_buffer`。`get_packets_to_send()` 控制滑动窗口，`get_packets_to_retransmit()` 扫描超时包，`on_data()` 实现重复包过滤和按序交付。
-- `server.py`：自主编写。通过 `pty.fork()` 为每个客户端创建独立 shell；用 `selectors` 复用 UDP socket 和 PTY fd；用 `TIOCSWINSZ` 同步窗口大小；根据心跳超时清理资源。
-- `client.py`：自主编写。用 `tty.setraw()` 进入 raw 模式，使用 `selectors` 同时监听 stdin 和 UDP socket；所有控制字符透明传输；退出时恢复终端属性。
+- `server.py`：自主编写。使用 `json` 读取用户库，使用 `hashlib.pbkdf2_hmac()` 和 `hmac.compare_digest()` 校验密码；通过 `pty.fork()` 为认证客户端创建独立 shell；在子进程中切换到用户目录；用 `selectors` 复用 UDP socket 和 PTY fd；用 `TIOCSWINSZ` 同步窗口大小；根据心跳超时清理资源。
+- `client.py`：自主编写。认证前使用普通终端输入用户名和密码；认证成功后用 `tty.setraw()` 进入 raw 模式，使用 `selectors` 同时监听 stdin 和 UDP socket；所有控制字符透明传输；退出时恢复终端属性。
 
 ## 测试及结果分析
 
@@ -153,27 +171,69 @@ python3 -m unittest discover -s lab7/tests
 覆盖内容：
 
 - 正常封包/解包。
+- `AUTH`、`AUTH_OK`、`AUTH_FAIL` 认证报文正常封包和解包。
 - magic 错误、checksum 错误、payload 长度不一致、header 长度不足时丢弃。
 - 空 payload 和最大 payload 正常处理。
 - 滑动窗口不超过默认窗口大小。
 - ACK 后窗口前移。
 - 超时后重传。
 - 重复包只处理一次，乱序包缓存后按序交付。
+- PBKDF2 密码校验、用户库字段校验、用户 home 路径越界拒绝。
+- 未认证客户端发送 `DATA` 时，服务端不创建 shell session。
 
 > 此处放置单元测试通过截图。
 
 结果分析：单元测试用于验证协议和可靠层的核心逻辑，能够证明非法报文不会导致崩溃，可靠层能在重复、乱序和超时场景下保持正确状态。
 
-### 测试2：基础命令执行
+### 测试2：登录认证与用户目录
 
 测试步骤：
 
 ```bash
-python3 lab7/udp_remote_terminal/server.py --host 0.0.0.0 --port 9000
+python3 lab7/udp_remote_terminal/server.py \
+  --host 0.0.0.0 \
+  --port 9000 \
+  --user-db lab7/udp_remote_terminal/users.json \
+  --home-root lab7/udp_remote_terminal/user_homes
+
 python3 lab7/udp_remote_terminal/client.py --host 127.0.0.1 --port 9000
 ```
 
-客户端连接后执行：
+先使用 `alice` / `123456` 登录，执行：
+
+```bash
+pwd
+touch hello.txt
+ls
+```
+
+再使用 `bob` / `123456` 登录，执行：
+
+```bash
+pwd
+ls
+```
+
+预期结果：`alice` 和 `bob` 登录成功后进入不同目录，`bob` 的初始目录中不会出现 `alice` 创建的 `hello.txt`。输入错误密码时，客户端打印认证失败并退出，服务端不创建 PTY shell。
+
+> 此处放置登录认证和不同用户目录截图。
+
+结果分析：认证阶段位于 session 创建之前，只有 `AUTH_OK` 后才进入 raw terminal 模式并创建 PTY。用户目录由服务端根据 `users.json` 和 `--home-root` 解析，目录不存在时自动创建，能够满足课程演示中的基础用户区分需求。
+
+### 测试3：基础命令执行
+
+测试步骤：
+
+```bash
+python3 lab7/udp_remote_terminal/server.py \
+  --host 0.0.0.0 \
+  --port 9000 \
+  --user-db lab7/udp_remote_terminal/users.json \
+  --home-root lab7/udp_remote_terminal/user_homes
+python3 lab7/udp_remote_terminal/client.py --host 127.0.0.1 --port 9000
+```
+
+客户端认证成功后执行：
 
 ```bash
 pwd
@@ -188,7 +248,7 @@ ip addr
 
 结果分析：普通命令输出经服务端 PTY 读取后分片发送给客户端，客户端按序写入 stdout，说明基础远程终端链路正常。
 
-### 测试3：多客户端并发
+### 测试4：多客户端并发
 
 测试步骤：
 
@@ -202,7 +262,7 @@ ip addr
 
 结果分析：服务端通过 `client_id` 区分 session，每个 session 拥有独立 PTY fd、shell pid 和可靠层状态，因此多客户端不会共享输入输出缓冲区。
 
-### 测试4：心跳与离线检测
+### 测试5：心跳与离线检测
 
 测试步骤：
 
@@ -217,7 +277,7 @@ ip addr
 
 结果分析：心跳机制解决 UDP 无连接场景下“无法天然感知对端断开”的问题，避免服务端长期保留无效 PTY 资源。
 
-### 测试5：实时输出与 Ctrl+C
+### 测试6：实时输出与 Ctrl+C
 
 测试命令：
 
@@ -233,7 +293,7 @@ ping 8.8.8.8
 
 结果分析：客户端 raw 模式不会本地拦截 Ctrl+C，而是将字节 `0x03` 发送给服务端 PTY。PTY 将其解释为终端中断信号，从而中断正在运行的 `ping`。
 
-### 测试6：top / vim 全屏程序
+### 测试7：top / vim 全屏程序
 
 测试命令：
 
@@ -253,7 +313,7 @@ vim test.txt
 
 结果分析：全屏程序依赖 PTY、ANSI 转义序列和窗口大小信息。本实现对控制字符和 ANSI 序列进行透明传输，并通过 `RESIZE` 报文同步行列数，因此能够支持基础全屏交互。
 
-### 测试7：抓包验证
+### 测试8：抓包验证
 
 抓包命令：
 
@@ -264,6 +324,7 @@ sudo tcpdump -i any udp port 9000 -X
 预期观察结果：
 
 - UDP 数据报中出现固定 magic `0x5554`。
+- 登录时出现 `AUTH`；认证成功时出现 `AUTH_OK`，错误密码时出现 `AUTH_FAIL`。
 - `DATA` 报文携带终端输入或输出。
 - `ACK` 报文携带确认序列号。
 - 空闲时周期性出现 `HEARTBEAT`。
@@ -272,19 +333,23 @@ sudo tcpdump -i any udp port 9000 -X
 
 > 此处放置 tcpdump 或 Wireshark 抓包截图。
 
-结果分析：抓包可以验证本实验确实基于 UDP 传输，并且可靠性、心跳和窗口同步均由自定义应用层协议完成，而不是依赖 TCP。
+结果分析：抓包可以验证本实验确实基于 UDP 传输，并且认证、可靠性、心跳和窗口同步均由自定义应用层协议完成，而不是依赖 TCP。需要注意，当前 `AUTH` 中的密码仍以明文出现在 UDP payload 中，因此只适合安全组限制来源 IP 后的课堂演示。
 
 ## 实验结论
 
 本实验完成了基于 UDP 的远程终端程序。程序通过自定义固定头部协议解决了 UDP 报文类型区分、合法性校验和元数据传递问题；通过 ACK、序列号、滑动窗口、超时重传和去重机制增强了 UDP 传输可靠性；通过 PTY 和 raw terminal 透传控制字符，实现了接近真实终端的远程 shell 交互。服务端使用 `selectors` 支持多客户端并发，并通过心跳机制清理异常离线 session。
 
+在此基础上，程序增加了实验级登录认证：服务端保存 PBKDF2-HMAC-SHA256 密码哈希，客户端认证成功后才会创建 PTY session，不同用户默认进入不同初始目录。结合云服务器安全组只允许本地公网 IP 访问 UDP 9000，可以满足课程演示中的基础访问控制需求。
+
+需要明确的是，当前目录隔离只是“初始目录隔离”，不是强安全边界。如果服务端仍以同一个 Linux 用户运行 `/bin/bash`，远程用户仍可能通过 `cd ..` 访问该 Linux 用户有权限访问的上层目录或文件；同时认证报文中的密码仍以明文 UDP payload 传输。如果要用于公网或真实生产环境，应改用 SSH，或进一步加入加密认证、HMAC、防重放机制，并在服务端使用 Linux 系统用户、`setuid()`/`setgid()`、`chroot`、容器或 namespace 实现系统级隔离。
+
 ## 总结及心得体会
 
-UDP 编程的难点不在于 socket API，而在于协议层需要自行处理可靠性、乱序、重复、连接状态和异常退出。远程终端程序还需要理解终端控制字符、ANSI 转义序列和 PTY 行为；如果只用普通子进程管道，很难支持 `top`、`vim` 等交互式程序。通过本实验，可以更清楚地理解 TCP 提供可靠字节流服务背后的复杂机制，也能体会到应用层协议设计对系统健壮性的影响。
+UDP 编程的难点不在于 socket API，而在于协议层需要自行处理可靠性、乱序、重复、连接状态、认证状态和异常退出。远程终端程序还需要理解终端控制字符、ANSI 转义序列和 PTY 行为；如果只用普通子进程管道，很难支持 `top`、`vim` 等交互式程序。通过本实验，可以更清楚地理解 TCP 提供可靠字节流服务背后的复杂机制，也能体会到应用层协议设计对系统健壮性和安全边界表达的影响。
 
 ## 附件
 
-1. 源码文件：`udp_remote_terminal/protocol.py`、`udp_remote_terminal/reliable.py`、`udp_remote_terminal/server.py`、`udp_remote_terminal/client.py`。
-2. 测试文件：`tests/test_protocol.py`、`tests/test_reliable.py`。
+1. 源码文件：`udp_remote_terminal/protocol.py`、`udp_remote_terminal/reliable.py`、`udp_remote_terminal/server.py`、`udp_remote_terminal/client.py`、`udp_remote_terminal/users.json`。
+2. 测试文件：`tests/test_protocol.py`、`tests/test_reliable.py`、`tests/test_server_auth.py`。
 3. 运行说明：`udp_remote_terminal/README.md`。
 4. 参考资料：实验指导书《高阶 题目5 基于UDP的远程终端实验指导书.docx》、实验七 PPT《实验七_Socket网络编程实验.pptx》、Python 官方文档中 `socket`、`selectors`、`pty`、`termios` 模块说明。

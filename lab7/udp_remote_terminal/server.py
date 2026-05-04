@@ -4,10 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from dataclasses import dataclass, field
 import errno
 import fcntl
+import hashlib
+import hmac
+import json
 import os
+from pathlib import Path
 import pty
 import selectors
 import signal
@@ -26,10 +32,58 @@ except ImportError:  # pragma: no cover
     from reliable import ReliableEndpoint, PendingPacket
 
 
+DEFAULT_USER_DB = Path(__file__).with_name("users.json")
+DEFAULT_HOME_ROOT = Path(__file__).with_name("user_homes")
+
+
+def shell_argv(shell: str) -> list[str]:
+    """Return argv for an interactive shell with host startup files disabled."""
+
+    shell_name = Path(shell).name
+    if shell_name in {"bash", "rbash"}:
+        return [shell, "--noprofile", "--norc", "-i"]
+    return [shell]
+
+
+def build_shell_env(username: str, home_dir: Path) -> dict[str, str]:
+    """Build a demo-oriented shell environment for one authenticated user."""
+
+    env = os.environ.copy()
+    home = str(home_dir)
+    env.update(
+        {
+            "HOME": home,
+            "PWD": home,
+            "USER": username,
+            "LOGNAME": username,
+            "UDPTERM_USER": username,
+            "UDPTERM_HOME": home,
+            "TERM": env.get("TERM", "xterm-256color"),
+            "LANG": env.get("LANG", "C.UTF-8"),
+            "PS1": f"{username}:\\w\\$ ",
+            "PROMPT_COMMAND": (
+                'case "$PWD" in "$HOME"|"$HOME"/*) ;; '
+                '*) printf "\\r\\n[server] returned to home: access outside ~ is disabled\\r\\n"; '
+                'cd "$HOME";; esac'
+            ),
+        }
+    )
+    return env
+
+
+@dataclass(frozen=True)
+class UserRecord:
+    username: str
+    password_hash: str
+    home: str
+
+
 @dataclass
 class ClientSession:
     client_id: int
     addr: tuple[str, int]
+    username: str
+    home_dir: Path
     pty_fd: int
     child_pid: int
     reliable: ReliableEndpoint
@@ -39,12 +93,91 @@ class ClientSession:
     closed: bool = False
 
 
+class AuthenticationError(ValueError):
+    """Raised when the authentication configuration or request is invalid."""
+
+
+def load_user_db(path: os.PathLike[str] | str) -> dict[str, UserRecord]:
+    """Load and validate the JSON user database."""
+
+    user_db_path = Path(path)
+    try:
+        with user_db_path.open("r", encoding="utf-8") as file_obj:
+            raw_users = json.load(file_obj)
+    except OSError as exc:
+        raise AuthenticationError(f"cannot read user database {user_db_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise AuthenticationError(f"invalid JSON in user database {user_db_path}: {exc}") from exc
+
+    if not isinstance(raw_users, dict):
+        raise AuthenticationError("user database must be a JSON object")
+
+    users: dict[str, UserRecord] = {}
+    for username, item in raw_users.items():
+        if not isinstance(username, str) or not username:
+            raise AuthenticationError("user database contains an invalid username")
+        if not isinstance(item, dict):
+            raise AuthenticationError(f"user {username!r} must be a JSON object")
+        password_hash = item.get("password_hash")
+        home = item.get("home")
+        if not isinstance(password_hash, str) or not password_hash:
+            raise AuthenticationError(f"user {username!r} is missing password_hash")
+        if not isinstance(home, str) or not home:
+            raise AuthenticationError(f"user {username!r} is missing home")
+        users[username] = UserRecord(
+            username=username,
+            password_hash=password_hash,
+            home=home,
+        )
+    return users
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify a password against pbkdf2_sha256$iterations$salt$hash."""
+
+    try:
+        algorithm, iterations_text, salt_text, digest_text = password_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        iterations = int(iterations_text)
+        if iterations <= 0:
+            return False
+        salt = base64.b64decode(salt_text.encode("ascii"), validate=True)
+        expected_digest = base64.b64decode(digest_text.encode("ascii"), validate=True)
+    except (ValueError, UnicodeEncodeError, binascii.Error):
+        return False
+
+    actual_digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    return hmac.compare_digest(actual_digest, expected_digest)
+
+
+def resolve_user_home(home_root: os.PathLike[str] | str, user: UserRecord) -> Path:
+    """Resolve a user's home directory and reject paths outside home_root."""
+
+    root = Path(home_root).expanduser().resolve(strict=False)
+    home_dir = (root / user.home).expanduser().resolve(strict=False)
+    try:
+        home_dir.relative_to(root)
+    except ValueError as exc:
+        raise AuthenticationError(
+            f"home for user {user.username!r} escapes home root"
+        ) from exc
+    return home_dir
+
+
 class UDPRemoteTerminalServer:
     def __init__(
         self,
         host: str,
         port: int,
         shell: str,
+        user_db: os.PathLike[str] | str = DEFAULT_USER_DB,
+        home_root: os.PathLike[str] | str = DEFAULT_HOME_ROOT,
         heartbeat_timeout: float = 15.0,
         retransmit_timeout: float = 0.5,
         window_size: int = 8,
@@ -53,6 +186,8 @@ class UDPRemoteTerminalServer:
         self.host = host
         self.port = port
         self.shell = shell
+        self.users = load_user_db(user_db)
+        self.home_root = Path(home_root).expanduser().resolve(strict=False)
         self.heartbeat_timeout = heartbeat_timeout
         self.verbose = verbose
         self.selector = selectors.DefaultSelector()
@@ -62,6 +197,7 @@ class UDPRemoteTerminalServer:
         self.sock.setblocking(False)
         self.selector.register(self.sock, selectors.EVENT_READ, data="udp")
         self.sessions: dict[int, ClientSession] = {}
+        self.authenticated_clients: dict[int, str] = {}
         self.retransmit_timeout = retransmit_timeout
         self.window_size = window_size
         self.running = True
@@ -71,7 +207,10 @@ class UDPRemoteTerminalServer:
             print(f"[server] {message}", file=sys.stderr, flush=True)
 
     def serve_forever(self) -> None:
-        self.log(f"listening on {self.host}:{self.port}, shell={self.shell}")
+        self.log(
+            f"listening on {self.host}:{self.port}, shell={self.shell}, "
+            f"users={len(self.users)}, home_root={self.home_root}"
+        )
         while self.running:
             events = self.selector.select(timeout=0.05)
             for key, _mask in events:
@@ -91,6 +230,7 @@ class UDPRemoteTerminalServer:
         self.running = False
         for client_id in list(self.sessions):
             self._close_session(client_id, notify=False)
+        self.authenticated_clients.clear()
         try:
             self.selector.unregister(self.sock)
         except Exception:
@@ -123,7 +263,20 @@ class UDPRemoteTerminalServer:
         if session is None:
             if packet.packet_type == PacketType.ACK:
                 return
-            session = self._create_session(packet.client_id, addr, packet.rows, packet.cols)
+            if packet.packet_type != PacketType.AUTH:
+                self.log(
+                    f"rejected unauthenticated {packet.packet_type.name} "
+                    f"from client {packet.client_id}@{addr}"
+                )
+                self._send_auth_response(
+                    packet.client_id,
+                    addr,
+                    PacketType.AUTH_FAIL,
+                    "authentication required",
+                )
+                return
+            self._handle_auth(packet, addr)
+            return
         else:
             session.addr = addr  # Allow NAT rebinding / client restart on same id.
 
@@ -132,6 +285,13 @@ class UDPRemoteTerminalServer:
         if packet.packet_type == PacketType.ACK:
             session.reliable.on_ack(packet.ack)
             self._flush_session(session, time.monotonic())
+        elif packet.packet_type == PacketType.AUTH:
+            self._send_auth_response(
+                packet.client_id,
+                addr,
+                PacketType.AUTH_OK,
+                "already authenticated",
+            )
         elif packet.packet_type == PacketType.DATA:
             if session.reliable.should_ack_data(packet.seq):
                 self._send_ack(session, packet.seq)
@@ -146,15 +306,72 @@ class UDPRemoteTerminalServer:
             self._send_ack(session, packet.seq)
             self._close_session(packet.client_id, notify=False)
 
+    def _handle_auth(self, packet: Packet, addr: tuple[str, int]) -> None:
+        try:
+            credentials = json.loads(packet.payload.decode("utf-8"))
+            if not isinstance(credentials, dict):
+                raise AuthenticationError("AUTH payload must be a JSON object")
+            username = credentials.get("username")
+            password = credentials.get("password")
+            if not isinstance(username, str) or not isinstance(password, str):
+                raise AuthenticationError("AUTH payload must include username and password")
+            user = self.users.get(username)
+            if user is None or not verify_password(password, user.password_hash):
+                raise AuthenticationError("invalid username or password")
+            home_dir = resolve_user_home(self.home_root, user)
+            home_dir.mkdir(parents=True, exist_ok=True)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_auth_response(
+                packet.client_id,
+                addr,
+                PacketType.AUTH_FAIL,
+                "invalid AUTH payload",
+            )
+            return
+        except (AuthenticationError, OSError) as exc:
+            self._send_auth_response(
+                packet.client_id,
+                addr,
+                PacketType.AUTH_FAIL,
+                str(exc),
+            )
+            return
+
+        self.authenticated_clients[packet.client_id] = username
+        try:
+            self._create_session(
+                packet.client_id,
+                addr,
+                username=username,
+                home_dir=home_dir,
+                rows=packet.rows,
+                cols=packet.cols,
+            )
+        except OSError as exc:
+            self.authenticated_clients.pop(packet.client_id, None)
+            self._send_auth_response(
+                packet.client_id,
+                addr,
+                PacketType.AUTH_FAIL,
+                f"failed to create session: {exc}",
+            )
+            return
+        self._send_auth_response(packet.client_id, addr, PacketType.AUTH_OK, "ok")
+
     def _create_session(
-        self, client_id: int, addr: tuple[str, int], rows: int = 0, cols: int = 0
+        self,
+        client_id: int,
+        addr: tuple[str, int],
+        username: str,
+        home_dir: Path,
+        rows: int = 0,
+        cols: int = 0,
     ) -> ClientSession:
         pid, fd = pty.fork()
         if pid == 0:  # Child shell process.
             try:
-                os.environ.setdefault("TERM", "xterm-256color")
-                os.environ.setdefault("LANG", "C.UTF-8")
-                os.execvp(self.shell, [self.shell])
+                os.chdir(home_dir)
+                os.execvpe(self.shell, shell_argv(self.shell), build_shell_env(username, home_dir))
             except Exception as exc:  # pragma: no cover - child exits immediately
                 os.write(2, f"exec shell failed: {exc}\n".encode())
                 os._exit(127)
@@ -163,6 +380,8 @@ class UDPRemoteTerminalServer:
         session = ClientSession(
             client_id=client_id,
             addr=addr,
+            username=username,
+            home_dir=home_dir,
             pty_fd=fd,
             child_pid=pid,
             reliable=ReliableEndpoint(
@@ -177,7 +396,10 @@ class UDPRemoteTerminalServer:
         self.sessions[client_id] = session
         self.selector.register(fd, selectors.EVENT_READ, data=("pty", client_id))
         self._resize_pty(session, session.rows, session.cols)
-        self.log(f"client {client_id} connected from {addr}, shell pid={pid}")
+        self.log(
+            f"client {client_id} authenticated as {username!r} from {addr}, "
+            f"home={home_dir}, shell pid={pid}"
+        )
         return session
 
     @staticmethod
@@ -257,6 +479,21 @@ class UDPRemoteTerminalServer:
         except OSError as exc:
             self.log(f"send to {session.client_id}@{session.addr} failed: {exc}")
 
+    def _send_auth_response(
+        self,
+        client_id: int,
+        addr: tuple[str, int],
+        packet_type: PacketType,
+        message: str,
+    ) -> None:
+        try:
+            self.sock.sendto(
+                pack_packet(packet_type, client_id=client_id, payload=message),
+                addr,
+            )
+        except OSError as exc:
+            self.log(f"send auth response to {client_id}@{addr} failed: {exc}")
+
     def _flush_session(self, session: ClientSession, now: float) -> None:
         for packet in session.reliable.get_packets_to_send(now):
             self._send_pending(session, packet)
@@ -280,6 +517,7 @@ class UDPRemoteTerminalServer:
                 self._close_session(client_id, notify=False)
 
     def _close_session(self, client_id: int, notify: bool = True) -> None:
+        self.authenticated_clients.pop(client_id, None)
         session = self.sessions.pop(client_id, None)
         if session is None or session.closed:
             return
@@ -331,6 +569,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=os.environ.get("SHELL", "/bin/bash"),
         help="shell executable for new PTY sessions",
     )
+    parser.add_argument(
+        "--user-db",
+        default=str(DEFAULT_USER_DB),
+        help="JSON user database with PBKDF2 password hashes",
+    )
+    parser.add_argument(
+        "--home-root",
+        default=str(DEFAULT_HOME_ROOT),
+        help="root directory for authenticated users' initial shell directories",
+    )
     parser.add_argument("--heartbeat-timeout", type=float, default=15.0)
     parser.add_argument("--retransmit-timeout", type=float, default=0.5)
     parser.add_argument("--window-size", type=int, default=8)
@@ -344,6 +592,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         host=args.host,
         port=args.port,
         shell=args.shell,
+        user_db=args.user_db,
+        home_root=args.home_root,
         heartbeat_timeout=args.heartbeat_timeout,
         retransmit_timeout=args.retransmit_timeout,
         window_size=args.window_size,
