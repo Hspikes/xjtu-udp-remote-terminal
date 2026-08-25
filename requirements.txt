@@ -1,0 +1,4 @@
+# Optional dependency for udp_remote_terminal/streamlit_monitor.py.
+# Pin a modern Python-3.12-compatible Streamlit release so pip does not
+# backtrack into old Streamlit/Tornado versions that fail to build.
+streamlit==1.57.0

@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+
+udp_remote_terminal/user_homes/*
+!udp_remote_terminal/user_homes/.gitkeep
